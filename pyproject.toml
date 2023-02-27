@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "arxiv-bot"
+version = "0.0.1"
+description = "ArXiv component of AI assistant"
+authors = ["James Briggs <james@aurelio.ai>"]
+readme = "README.md"
+packages = [
+    {include = "arxiv_bot"},
+    {include = "arxiv_bot/knowledge_base"}
+]
+
+[tool.poetry.dependencies]
+python = ">=3.8.1,<4.0"
+langchain = "^0.0.94"
+arxiv = "^1.4.3"
+pypdf2 = "^3.0.1"
+openai = "^0.26.5"
+pinecone-client = "^2.2.1"
+tiktoken = "^0.2.0"
+
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.hatch.version]
+path = "VERSION.txt"
+pattern = "(?P<version>.+)"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/arxiv_bot",
+    "/VERSION.txt",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "arxiv_bot",
+    "arxiv_bot.knowledge_base",
+]
