@@ -6,9 +6,11 @@ import json
 import requests
 from getpass import getpass
 from langchain import PromptTemplate, OpenAI, LLMChain
-from langchain.text_splitter import TokenTextSplitter
+from langchain.text_splitter import TokenTextSplitter, CharacterTextSplitter
+import tiktoken
+from tqdm.auto import tqdm
 
-from typing import Union
+from typing import Union, Any
 
 paper_id_re = re.compile(r'https://arxiv.org/abs/(\d+\.\d+)')
 
@@ -81,9 +83,19 @@ def init_extractor(
     )
     return extractor, text_splitter
 
+def tiktoken_splitter(max_tokens=650, separator=' '):
+    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(
+        separator=separator,
+        encoding_name='p50k_base',
+        chunk_size=max_tokens,
+        chunk_overlap=100,  # let's add a small 2-4 sentence overlap
+        disallowed_special=()
+    )
+    return text_splitter
+
 class Arxiv:
     refs_re = re.compile(r'\n(References|REFERENCES)\n')
-    citations = []
+    references = []
     template = """You are a master PDF reader and when given a set of references you
     always extract the most important information of the papers. For example, when
     you were given the following references:
@@ -172,13 +184,13 @@ class Arxiv:
         :return: The references for the paper
         :rtype: list
         """
-        if len(self.citations) == 0:
+        if len(self.references) == 0:
             self._download_refs(extractor, text_splitter)
-        return self.citations
+        return self.references
         
     def _download_refs(self, extractor, text_splitter):
         """Download the references for the paper. Stores them in
-        the self.citations attribute.
+        the self.references attribute.
 
         :param extractor: The LLMChain extractor model
         :type extractor: LLMChain
@@ -205,7 +217,7 @@ class Arxiv:
             'authors': o[1],
             'year': o[2]
         } for o, _id in zip(out, ids) if _id is not None]
-        self.citations = meta
+        self.references = meta
     
     def _convert_pdf_to_text(self):
         """Convert the PDF to text and store it in the self.content
@@ -255,6 +267,28 @@ class Arxiv:
         """
         with open(f'papers/{self.id}.json', 'w') as fp:
             json.dump(self.__dict__(), fp, indent=4)
+
+    def save_chunks(
+        self,
+        include_metadata: bool = True,
+        path: str = "chunks"
+        ):
+        """Save the paper's chunks to a local JSONL file.
+        
+        :param include_metadata: Whether to include the paper's
+                                 metadata in the chunks, defaults
+                                 to True
+        :type include_metadata: bool, optional
+        :param path: The path to save the file to, defaults to "papers"
+        :type path: str, optional
+        """
+        if not os.path.exists(path):
+            os.makedirs(path)
+        with open(f'{path}/{self.id}.jsonl', 'w') as fp:
+            for chunk in self.dataset:
+                if include_metadata:
+                    chunk.update(self.get_meta())
+                fp.write(json.dumps(chunk) + '\n')
     
     def get_meta(self):
         """Returns the meta information for the paper.
@@ -266,6 +300,47 @@ class Arxiv:
         # drop content field because it's big
         fields.pop('content')
         return fields
+    
+    def chunker(self, max_tokens=650):
+        # clean and split into initial smaller chunks
+        clean_paper = self._clean_text(self.content)
+        splitter = tiktoken_splitter(separator='\n')
+        
+        langchain_dataset = []
+
+        paper_chunks = splitter.split_text(clean_paper)
+        for i, chunk in enumerate(paper_chunks):
+            langchain_dataset.append({
+                'doi': self.id,
+                'chunk-id': str(i),
+                'chunk': chunk
+            })
+        # not all chunks will be under 650 tokens because not all can be split by \n
+        # so we need to split them further with whitespace
+        splitter = tiktoken_splitter(separator=' ')
+        tokenizer = tiktoken.get_encoding('p50k_base')
+        for i, record in enumerate(langchain_dataset):
+            chunk = record['chunk']
+            chunk_len = len(tokenizer.encode(chunk, disallowed_special=()))
+            if chunk_len > max_tokens+200:
+                print(f'Chunk too long: {chunk_len}')
+                # break into smaller chunks
+                mini_chunks = splitter.split_text(chunk)
+                # the first chunk must replace the original chunk
+                langchain_dataset[i]['chunk'] = mini_chunks[0]
+                # the rest of the chunks must be added to the dataset
+                for j, mini_chunk in enumerate(mini_chunks[1:]):
+                    langchain_dataset.append({
+                        'doi': record['doi'],
+                        'chunk-id': f"{record['chunk-id']}-{j}",
+                        'chunk': mini_chunk
+                    })
+                print(f"{record['doi']} {record['chunk-id']} split into {len(mini_chunks)} chunks")
+        self.dataset = langchain_dataset
+
+    def _clean_text(self, text):
+        text = re.sub(r'-\n', '', text)
+        return text
 
     def __dict__(self):
         return {
@@ -281,8 +356,79 @@ class Arxiv:
             'published': self.published,
             'updated': self.updated,
             'content': self.content,
-            'citations': self.citations
+            'references': self.references
         }
     
     def __repr__(self):
         return f"Arxiv(paper_id='{self.id}')"
+    
+
+class ArxivGraphScraper:
+    def __init__(
+        self,
+        paper_id: str,
+        extractor: Any,
+        text_splitter: Any,
+        levels: int = 3,
+        save_location: str = 'chunks'
+    ):
+        """Build a graph of papers beginning with the paper_id provided,
+        identifying the top papers referenced in that paper, downloading
+        those papers and repeating. The number of levels to search is
+        controlled by the levels parameter.
+        
+        :param paper_id: The paper ID to start the graph from
+        :type paper_id: str
+        :param levels: The number of levels to search, defaults to 3
+        :type levels: int, optional
+        """
+        self.paper_id = paper_id
+        self.levels = levels
+        self.save_location = save_location
+        if not os.path.exists(self.save_location):
+            os.mkdir(self.save_location)
+        # save objects required for ref extraction
+        self.extractor = extractor
+        self.text_splitter = text_splitter
+        ids = [paper_id]
+        for level in tqdm(range(levels)):
+            ids = self._build_papers(ids)
+            
+
+    def _create_paper(self, paper_id: str):
+        """Create a paper object from a paper ID.
+        
+        :param paper_id: The paper ID
+        :type paper_id: str
+        :return: The paper object
+        :rtype: ArxivPaper
+        """
+        print(f"Loading '{paper_id}'")
+        paper = Arxiv(paper_id)
+        paper.load()
+        paper.get_meta()
+        # get references
+        refs = paper.get_refs(
+            extractor=self.extractor,
+            text_splitter=self.text_splitter
+        )
+        paper.chunker()
+        paper.save_chunks(include_metadata=True, path=self.save_location)
+        return paper
+    
+    def _build_papers(self, paper_ids: list):
+        """Build a list of referenced papers from a list of paper IDs.
+        
+        :param paper_ids: The list of paper IDs
+        :type paper_ids: list
+        :return: The list of referenced papers
+        :rtype: list
+        """
+        ids = []
+        for _id in tqdm(paper_ids):
+            paper = self._create_paper(_id)
+            ids.extend([r['id'] for r in paper.references])
+        original_ids = set(paper_ids)
+        new_ids = set(ids)
+        return list(new_ids - original_ids)
+

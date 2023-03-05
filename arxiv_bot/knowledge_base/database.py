@@ -4,33 +4,36 @@ from uuid import uuid4
 from tqdm.auto import tqdm
 
 import torch
-from transformers import AutoTokenizerFast
-from splade.models.transformers_rep import Splade
+from transformers import AutoTokenizer, AutoModelForMaskedLM
 
 import pinecone
-import langchain
+import openai
 
 
 dense_models = {
     'text-embedding-ada-002': {
         'source': 'openai',
-        'dimension': 1538,
-        'api_key': True
+        'dimension': 1536,
+        'api_key': True,
+        'metric': 'dotproduct'
     },
     'multilingual-22-12': {
         'source': 'cohere',
         'dimension': 768,
-        'api_key': True
+        'api_key': True,
+        'metric': 'dotproduct'
     }
 }
 
 
 class Pinecone:
+    log = []
     def __init__(
         self,
         index_name: str,
-        api_key: Optional[str] = None,
+        pinecone_api_key: Optional[str] = None,
         environment: str = 'us-east1-gcp',
+        openai_api_key: Optional[str] = None,
         dense_model_name: Optional[str] = 'text-embedding-ada-002',
         sparse_model_name: Optional[str] = 'naver/splade-cocondenser-ensembledistil',
         device: Optional[str] = None
@@ -38,25 +41,28 @@ class Pinecone:
         # set local device
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         # initialize dense model
-        self._init_dense(dense_model_name, api_key)
+        openai_api_key = openai_api_key or os.environ['OPENAI_API_KEY']
+        self._init_dense(dense_model_name, openai_api_key)
         # initialize sparse model
         self._init_sparse(sparse_model_name)
 
         # initialize connection to Pinecone
-        api_key = api_key or os.environ['PINECONE_API_KEY']
+        pinecone_api_key = pinecone_api_key or os.environ['PINECONE_API_KEY']
         pinecone.init(
-            api_key=api_key,
+            api_key=pinecone_api_key,
             environment=environment
         )
         # check if index exists
         if index_name not in pinecone.list_indexes():
             pinecone.create_index(
-                name=index_name,
-                pod_type='s1'
+                index_name,
+                pod_type='s1',
+                dimension=self.dense_meta['dimension'],
+                metric=self.dense_meta['metric']
             )
         self.index_name = index_name
-        self.api_key = api_key
-        self.index = pinecone.Index(name=self.index_name, api_key=self.api_key)
+        self.pinecone_api_key = pinecone_api_key
+        self.index = pinecone.Index(self.index_name)
     
     def add(
         self,
@@ -64,7 +70,7 @@ class Pinecone:
         ids: Optional[list]=None,
         metadata: Optional[list]=None,
         batch_size: int = 64,
-        overwrite=True
+        overwrite=False
     ):
         """Encodes texts and upserts to Pinecone index.
 
@@ -99,15 +105,29 @@ class Pinecone:
                 metadata[j]['text-field'] = text
             # create upsert list
             upsert = []
-            for j in range(i, i_end):
+            for _id, values, sparse_values, meta in zip(ids, dense_emb, sparse_emb, metadata):
                 upsert.append({
-                    'id': ids[j],
-                    'values': dense_emb[j],
-                    'sparse_values': sparse_emb[j],
-                    'metadata': metadata[j]
+                    'id': _id,
+                    'values': values,
+                    'sparse_values': sparse_values,
+                    'metadata': meta
                 })
             # upsert to Pinecone
-            self.index.upsert(upsert)
+            try:
+                self.index.upsert(upsert)
+            except ValueError as e:
+                # loop through each item and try to upsert individually
+                for item in upsert:
+                    try:
+                        self.index.upsert([item])
+                    except ValueError as e:
+                        # if there is an error we log error message and values that caused it
+                        self.log.append({
+                            'error': str(e),
+                            'upsert_values': item
+                        })
+                        print("Error during upsert, see Pinecone.log for details")
+
         return self.index.describe_index_stats()
     
     def _encode(self, texts: list):
@@ -142,43 +162,56 @@ class Pinecone:
 
 
 class SpladeModel:
-    def __init__(self, model_name: str, device: Optional[str] = None):
+    def __init__(
+        self,
+        model_name: Optional[str] = 'naver/splade-cocondenser-ensembledistil',
+        device: Optional[str] = None
+    ):
         # initialize model
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = Splade(model_name, agg='max')
+        self.model = AutoModelForMaskedLM.from_pretrained(model_name)
         # move to cuda if enabled
         self.model.to(self.device)
         # set to inference mode
         self.model.eval()
         # initialize tokenizer
-        self.tokenizer = AutoTokenizerFast.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def __call__(self, texts: str):
+    def __call__(self, texts: list):
         if type(texts) == str:
             texts = [texts]
         # tokenize
-        inputs = self.tokenizer(
+        tokens = self.tokenizer(
             texts, add_special_tokens=False,
-            return_tensors='pt'
+            return_tensors='pt', truncation=True,
+            padding=True
         ).to(self.device)
         # create sparse embedding
         with torch.no_grad():
-            sparse_emb = self.model(
-                d_kwargs=inputs
-            )['d_rep'].squeeze()
+            output = self.model(**tokens)
+            sparse_emb = torch.max(
+                torch.log(
+                    1 + torch.relu(output.logits)
+                ) * tokens.attention_mask.unsqueeze(-1),
+            dim=1)[0].squeeze()
         # extract indices and their values
-        indices = sparse_emb.nonzero().squeeze().cpu().tolist()
-        values = sparse_emb[indices].cpu().tolist()
+        indices = []
+        values = []
+        for i in range(sparse_emb.shape[0]):
+            indices.append(sparse_emb[i].nonzero().squeeze().cpu().tolist())
+            values.append(sparse_emb[i][indices[i]].cpu().tolist())
         # return sparse embedding in pinecone format
-        return {'indices': indices, 'values': values}
+        return [{'indices': idx, 'values': vals} for idx, vals in zip(indices, values)]
 
 class DenseOpenAI:
     def __init__(self, model_name: str, api_key: Optional[str] = None):
-        api_key = api_key or os.environ['OPENAI_API_KEY']
-        self.model = langchain.llms.OpenAI(
-            model_name=model_name,
-            openai_api_key=api_key
-        )
+        self.api_key = api_key or os.environ['OPENAI_API_KEY']
+        self.model_name = model_name
     
-    def __call__(self, text: str):
-        return self.model(text)
+    def __call__(self, texts: list):
+        res = openai.Embedding.create(
+            input=texts,
+            engine=self.model_name
+        )
+        embeddings = [record['embedding'] for record in res['data']]
+        return embeddings
