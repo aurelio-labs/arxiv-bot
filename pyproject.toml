@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "arxiv-bot"
-version = "0.0.1"
+version = "0.0.3"
 description = "ArXiv component of AI assistant"
 authors = ["James Briggs <james@aurelio.ai>"]
 readme = "README.md"
