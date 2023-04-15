@@ -5,6 +5,7 @@ from tqdm.auto import tqdm
 
 import torch
 from transformers import AutoTokenizer, AutoModelForMaskedLM
+from pinecone_text.sparse.splade_encoder import SpladeEncoder
 
 import pinecone
 import openai
@@ -169,39 +170,15 @@ class SpladeModel:
     ):
         # initialize model
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = AutoModelForMaskedLM.from_pretrained(model_name)
-        # move to cuda if enabled
-        self.model.to(self.device)
-        # set to inference mode
-        self.model.eval()
-        # initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = SpladeEncoder(device=device)
 
     def __call__(self, texts: list):
         if type(texts) == str:
             texts = [texts]
-        # tokenize
-        tokens = self.tokenizer(
-            texts, add_special_tokens=False,
-            return_tensors='pt', truncation=True,
-            padding=True
-        ).to(self.device)
-        # create sparse embedding
-        with torch.no_grad():
-            output = self.model(**tokens)
-            sparse_emb = torch.max(
-                torch.log(
-                    1 + torch.relu(output.logits)
-                ) * tokens.attention_mask.unsqueeze(-1),
-            dim=1)[0].squeeze()
-        # extract indices and their values
-        indices = []
-        values = []
-        for i in range(sparse_emb.shape[0]):
-            indices.append(sparse_emb[i].nonzero().squeeze().cpu().tolist())
-            values.append(sparse_emb[i][indices[i]].cpu().tolist())
+        # encode
+        embeds = self.model.encode_documents(texts)
         # return sparse embedding in pinecone format
-        return [{'indices': idx, 'values': vals} for idx, vals in zip(indices, values)]
+        return embeds
 
 class DenseOpenAI:
     def __init__(self, model_name: str, api_key: Optional[str] = None):

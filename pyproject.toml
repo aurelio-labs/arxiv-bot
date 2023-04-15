@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "arxiv-bot"
-version = "0.0.3"
+version = "0.0.4"
 description = "ArXiv component of AI assistant"
 authors = ["James Briggs <james@aurelio.ai>"]
 readme = "README.md"
@@ -19,6 +19,7 @@ pinecone-client = ">=2.2.1,<3.0"
 tiktoken = "^0.2.0"
 transformers = "^4.26.1"
 tqdm = "^4.64.1"
+pinecone-text = "^0.4.2"
 
 
 [build-system]

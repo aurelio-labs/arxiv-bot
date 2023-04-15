@@ -4,15 +4,35 @@ import arxiv
 import PyPDF2
 import json
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from getpass import getpass
 from langchain import PromptTemplate, OpenAI, LLMChain
-from langchain.text_splitter import TokenTextSplitter, CharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 import tiktoken
 from tqdm.auto import tqdm
 
-from typing import Union, Any
+import logging
+from typing import Union, Any, Optional
 
 paper_id_re = re.compile(r'https://arxiv.org/abs/(\d+\.\d+)')
+
+def retry_request_session(retries: Optional[int] = 5):
+    # we setup retry strategy to retry on common errors
+    retries = Retry(
+        total=retries,
+        backoff_factor=0.1,
+        status_forcelist=[
+            408,  # request timeout
+            500,  # internal server error
+            502,  # bad gateway
+            503,  # service unavailable
+            504   # gateway timeout
+        ]
+    )
+    # we setup a session with the retry strategy
+    session = requests.Session()
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    return session
 
 def get_paper_id(query: str, handle_not_found: bool = True):
     """Get the paper ID from a query.
@@ -35,8 +55,10 @@ def get_paper_id(query: str, handle_not_found: bool = True):
     translation_table = query.maketrans(special_chars)
     # use the translate method to replace the special characters
     search_term = query.translate(translation_table)
+    # init requests search session
+    session = retry_request_session()
     # get the search results
-    res = requests.get(f"https://www.google.com/search?q={search_term}&sclient=gws-wiz-serp")
+    res = session.get(f"https://www.google.com/search?q={search_term}&sclient=gws-wiz-serp")
     try:
         # extract the paper id
         paper_id = paper_id_re.findall(res.text)[0]
@@ -52,9 +74,9 @@ def get_paper_id(query: str, handle_not_found: bool = True):
 def init_extractor(
     template: str,
     openai_api_key: Union[str, None] = None,
-    max_tokens: int = 500,
-    chunk_size: int = 1000,
-    chunk_overlap: int = 500
+    max_tokens: int = 1000,
+    chunk_size: int = 300,
+    chunk_overlap: int = 40
 ):
     if openai_api_key is None and 'OPENAI_API_KEY' not in os.environ:
         raise Exception('No OpenAI API key provided')
@@ -76,22 +98,29 @@ def init_extractor(
         prompt=prompt,
         llm=llm
     )
-    text_splitter = TokenTextSplitter.from_tiktoken_encoder(
-        encoding_name='p50k_base',
+    text_splitter = tiktoken_splitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap
     )
     return extractor, text_splitter
 
-def tiktoken_splitter(max_tokens=650, separator=' '):
-    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(
-        separator=separator,
-        encoding_name='p50k_base',
-        chunk_size=max_tokens,
-        chunk_overlap=100,  # let's add a small 2-4 sentence overlap
-        disallowed_special=()
+def tiktoken_splitter(chunk_size=300, chunk_overlap=40):
+    tokenizer = tiktoken.get_encoding('p50k_base')
+    # create length function
+    def len_fn(text):
+        tokens = tokenizer.encode(
+            text, disallowed_special=()
+        )
+        return len(tokens)
+    # initialize the text splitter
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len_fn,
+        separators=["\n\n", "\n", " ", ""]
     )
     return text_splitter
+
 
 class Arxiv:
     refs_re = re.compile(r'\n(References|REFERENCES)\n')
@@ -146,6 +175,8 @@ class Arxiv:
         """
         self.id = paper_id
         self.url = f"https://export.arxiv.org/pdf/{paper_id}.pdf"
+        # initialize the requests session
+        self.session = requests.Session()
     
     def load(self, save: bool = False):
         """Load the paper from the ArXiv API or from a local file
@@ -164,7 +195,7 @@ class Arxiv:
             for key, value in attributes.items():
                 setattr(self, key, value)
         else:
-            res = requests.get(self.url)
+            res = self.session.get(self.url)
             with open(f'temp.pdf', 'wb') as fp:
                 fp.write(res.content)
             # extract text content
@@ -217,6 +248,7 @@ class Arxiv:
             'authors': o[1],
             'year': o[2]
         } for o, _id in zip(out, ids) if _id is not None]
+        logging.debug(f"Extracted {len(meta)} references")
         self.references = meta
     
     def _convert_pdf_to_text(self):
@@ -255,12 +287,13 @@ class Arxiv:
         self.categories = result.categories
         self.comment = result.comment
         self.journal_ref = result.journal_ref
-        self.pdf_url = result.pdf_url
+        self.source = result.pdf_url
         self.primary_category = result.primary_category
         self.published = result.published.strftime('%Y%m%d')
         self.summary = result.summary
         self.title = result.title
         self.updated = result.updated.strftime('%Y%m%d')
+        logging.debug(f"Downloaded metadata for paper '{self.id}'")
 
     def save(self):
         """Save the paper to a local JSON file.
@@ -289,6 +322,7 @@ class Arxiv:
                 if include_metadata:
                     chunk.update(self.get_meta())
                 fp.write(json.dumps(chunk) + '\n')
+            logging.debug(f"Saved paper to '{path}/{self.id}.jsonl'")
     
     def get_meta(self):
         """Returns the meta information for the paper.
@@ -301,10 +335,10 @@ class Arxiv:
         fields.pop('content')
         return fields
     
-    def chunker(self, max_tokens=650):
+    def chunker(self, chunk_size=300):
         # clean and split into initial smaller chunks
         clean_paper = self._clean_text(self.content)
-        splitter = tiktoken_splitter(separator='\n')
+        splitter = tiktoken_splitter(chunk_size=chunk_size)
         
         langchain_dataset = []
 
@@ -315,27 +349,7 @@ class Arxiv:
                 'chunk-id': str(i),
                 'chunk': chunk
             })
-        # not all chunks will be under 650 tokens because not all can be split by \n
-        # so we need to split them further with whitespace
-        splitter = tiktoken_splitter(separator=' ')
-        tokenizer = tiktoken.get_encoding('p50k_base')
-        for i, record in enumerate(langchain_dataset):
-            chunk = record['chunk']
-            chunk_len = len(tokenizer.encode(chunk, disallowed_special=()))
-            if chunk_len > max_tokens+200:
-                print(f'Chunk too long: {chunk_len}')
-                # break into smaller chunks
-                mini_chunks = splitter.split_text(chunk)
-                # the first chunk must replace the original chunk
-                langchain_dataset[i]['chunk'] = mini_chunks[0]
-                # the rest of the chunks must be added to the dataset
-                for j, mini_chunk in enumerate(mini_chunks[1:]):
-                    langchain_dataset.append({
-                        'doi': record['doi'],
-                        'chunk-id': f"{record['chunk-id']}-{j}",
-                        'chunk': mini_chunk
-                    })
-                print(f"{record['doi']} {record['chunk-id']} split into {len(mini_chunks)} chunks")
+        logging.debug(f"Split paper into {len(paper_chunks)} chunks")
         self.dataset = langchain_dataset
 
     def _clean_text(self, text):
@@ -347,7 +361,7 @@ class Arxiv:
             'id': self.id,
             'title': self.title,
             'summary': self.summary,
-            'pdf_url': self.pdf_url,
+            'source': self.source,
             'authors': self.authors,
             'categories': self.categories,
             'comment': self.comment,
@@ -370,7 +384,8 @@ class ArxivGraphScraper:
         extractor: Any,
         text_splitter: Any,
         levels: int = 3,
-        save_location: str = 'chunks'
+        save_location: str = 'chunks',
+        verbose: bool = False
     ):
         """Build a graph of papers beginning with the paper_id provided,
         identifying the top papers referenced in that paper, downloading
@@ -393,7 +408,18 @@ class ArxivGraphScraper:
         ids = [paper_id]
         for level in tqdm(range(levels)):
             ids = self._build_papers(ids)
-            
+        # set logging level
+        if verbose:
+            logging.basicConfig(
+                format='[%(filename)s:%(lineno)d] %(message)s',
+                level=logging.DEBUG
+            )
+            # further logging options for when working with ipython+jupyter
+            console = logging.StreamHandler()
+            console.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('[%(filename)s:%(lineno)d] %(message)s')
+            console.setFormatter(formatter)
+            logging.getLogger('').addHandler(console)
 
     def _create_paper(self, paper_id: str):
         """Create a paper object from a paper ID.
@@ -430,5 +456,6 @@ class ArxivGraphScraper:
             ids.extend([r['id'] for r in paper.references])
         original_ids = set(paper_ids)
         new_ids = set(ids)
-        return list(new_ids - original_ids)
-
+        new_ids = list(new_ids - original_ids)
+        logging.debug(f"Found {len(new_ids)} new papers")
+        return new_ids
