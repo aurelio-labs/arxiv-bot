@@ -5,7 +5,6 @@ import PyPDF2
 import json
 import requests
 from requests.adapters import HTTPAdapter, Retry
-from getpass import getpass
 from langchain import PromptTemplate, OpenAI, LLMChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import tiktoken

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "arxiv-bot"
-version = "0.0.4"
+version = "0.0.5"
 description = "ArXiv component of AI assistant"
 authors = ["James Briggs <james@aurelio.ai>"]
 readme = "README.md"
@@ -11,10 +11,10 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.8.1,<4.0"
-langchain = "^0.0.96"
+langchain = "^0.0.141"
 arxiv = "^1.4.3"
 pypdf2 = "^3.0.1"
-openai = "^0.26.5"
+openai = "^0.27.4"
 pinecone-client = ">=2.2.1,<3.0"
 tiktoken = "^0.2.0"
 transformers = "^4.26.1"
