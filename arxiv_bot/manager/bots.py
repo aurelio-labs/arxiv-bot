@@ -1,13 +1,68 @@
 import os
 from typing import Optional, Union, Dict, Any
 import logging
+import re
 
 import langchain
+from langchain.tools import BaseTool
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 
+from arxiv_bot import templates
 from arxiv_bot.knowledge_base.database import Pinecone
+from arxiv_bot.knowledge_base.constructors import Arxiv, init_extractor, get_paper_id
 
+paper_id_re = re.compile(r'(\d{4}\.\d{4,6})')
 
+class AddArticleTool(BaseTool):
+    name = "Add to ArXiv DB"
+    description = "use this tool to add a new paper to the ArXiv DB. If human provides ArXiv ID like 1012.1313 pass this to the tool. Otherwise try and use the human's query."
+    memory: Any = None
+
+    def _run(self, query: str) -> str:
+        """Function to be used for adding articles to the ArXiv database it expects
+        an arXiv ID as input and will add the article to the database.
+        """
+        # get ArXiv ID from input text if exists
+        # extract the paper id
+        matches = paper_id_re.findall(query)
+        if matches == []:
+            # check we have 'arxiv' and 'paper' terms in query
+            for term in ['arxiv', 'paper']:
+                if term not in query.lower():
+                    # add the terms to the query if not
+                    query = ' '.join([query, term])
+            # try and extract if this is natural language query
+            paper_id = get_paper_id(query)
+        else:
+            paper_id = matches[0]
+        # check again for paper ID
+        if paper_id is None:
+            return "ArXiv paper could not be found"
+        # get single arxiv object
+        paper = Arxiv(paper_id)
+        # load the paper
+        paper.load()
+        # get paper metadata
+        paper_metadata = paper.get_meta()
+        # chunk into smaller parts
+        paper.chunker()
+        # now add to the database
+        ids = []
+        texts = []
+        metadatas = []
+        for record in paper.dataset:
+            record = {**record, **paper_metadata}
+            ids.append(f"{record['id']}-{record['chunk-id']}")
+            texts.append(record['chunk'])
+            for feature in ['id', 'chunk-id', 'summary', 'authors', 'comment', 'categories', 'journal_ref', 'references', 'doi', 'chunk']:
+                record.pop(feature)
+            metadatas.append(record)
+        # add to the database
+        self.memory.add(texts, ids=ids, metadata=metadatas)
+        return f"Added {paper_id} to the memory. It is now accessible."
+
+    def _arun(self, query: str) -> str:
+        raise NotImplementedError("AddArticleTool does not support async")
 
 class Arxiver:
     search_description = (
@@ -26,6 +81,7 @@ class Arxiver:
         "When external information is used you MUST add your sources to the end "
         "of responses."
     )
+    ref_template = templates.reference_extraction['template']
     tools = []
     def __init__(
         self,
@@ -45,6 +101,8 @@ class Arxiver:
         )
         # initialize the chatbot
         self._init_chatbot(verbose=verbose)
+        # initialize the extraction tooling
+        self._init_splitter()
 
     def __call__(self, text: str, detailed: bool = False) -> dict:
         response = self.agent(text)
@@ -52,6 +110,9 @@ class Arxiver:
             return response
         else:
             return {'output': response['output']}
+        
+    def _init_splitter(self):
+        self.extractor, self.text_splitter = init_extractor(self.ref_template)
 
     def _init_llm(
         self,
@@ -106,6 +167,11 @@ class Arxiver:
         )
         # append to tools list
         self.tools.append(arxiv_db_tool)
+        # initialize add article tool
+        article_add_tool = AddArticleTool()
+        article_add_tool.memory = self.memory
+        # append to tools list
+        self.tools.append(article_add_tool)
 
     def _init_chatbot(self, verbose: bool = False):
         # initialize conversational memory
@@ -130,6 +196,39 @@ class Arxiver:
             tools=self.tools
         )
         self.agent.agent.llm_chain.prompt = prompt
+
+    def _add_article_to_db(
+        self,
+        inputs: Union[Dict[str, Any], Any],
+        return_only_outputs: bool = False
+    ) -> Dict[str, Any]:
+        """Function to be used for adding articles to the ArXiv database it expects
+        an arXiv ID as input and will add the article to the database.
+        """
+        arxiv_doi = inputs['arxiv_doi']
+        # get single arxiv object
+        paper = Arxiv(arxiv_doi)
+        # load the paper
+        paper.load()
+        # get paper metadata
+        paper_metadata = paper.get_meta()
+        # chunk into smaller parts
+        paper.chunker()
+        # now add to the database
+        ids = []
+        texts = []
+        metadatas = []
+        for record in paper.dataset:
+            record = {**record, **paper_metadata}
+            ids.append(f"{record['id']}-{record['chunk-id']}")
+            texts.append(record['chunk'])
+            for feature in ['id', 'chunk-id', 'summary', 'authors', 'comment', 'categories', 'journal_ref', 'references', 'doi', 'chunk']:
+                record.pop(feature)
+            metadatas.append(record)
+        # add to the database
+        self.memory.add(texts, ids=ids, metadata=metadatas)
+        return {'answer': f"Added {arxiv_doi} to my memory. It is now accessible via the Search Arxiv DB tool."}
+
 
     def _search_arxiv_db(
         self,
