@@ -30,7 +30,7 @@ cember 6-12, 2020, virtual .
 You extract the following:
 
 Layer normalization | Lei Jimmy Ba, Jamie Ryan Kiros, Geoffrey E. Hinton | 2016
-PADA: A prompt-based autoregressive approach for adaptation to unseen domains | Eyal Ben-David, Nadav Oved, Roi Reichart
+PADA: A prompt-based autoregressive approach for adaptation to unseen domains | Eyal Ben-David, Nadav Oved, Roi Reichart | 2021
 Language models are few-shot learners | Tom B. Brown, et al. | 2020
 
 In the References below there are many papers. Extract their titles, authors, and years.
