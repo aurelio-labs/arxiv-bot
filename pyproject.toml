@@ -20,6 +20,7 @@ tiktoken = "^0.2.0"
 transformers = "^4.26.1"
 tqdm = "^4.64.1"
 pinecone-text = "^0.4.2"
+colorlog = "^6.7.0"
 
 
 [build-system]
